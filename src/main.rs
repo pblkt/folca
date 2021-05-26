@@ -47,27 +47,30 @@ fn main() -> Result<(), Report> {
     let mut inventory = Inventory::load(opt.cache_path.clone());
 
     let cur_key = opt.create_key();
+    trace!("Computed key: {:#?}", cur_key);
 
     if let (Some(cur_key), Some(inventory)) = (&cur_key, inventory.as_mut()) {
-        if inventory.restore(&cur_key, &opt.output_path) {
+        if inventory.restore(&cur_key, &opt.output_path, opt.dry_run) {
             return Ok(());
         }
     }
 
-    info!("Running command");
-    let exit_status = std::process::Command::new(&opt.command[0])
-        .args(&opt.command[1..])
-        .status()
-        .wrap_err("Cannot start command")?;
-    if !exit_status.success() {
-        trace!("Child failed, returning its exit code");
-        std::process::exit(exit_status.code().unwrap_or(0))
+    if !opt.dry_run {
+        info!("Running command");
+        let exit_status = std::process::Command::new(&opt.command[0])
+            .args(&opt.command[1..])
+            .status()
+            .wrap_err("Cannot start command")?;
+        if !exit_status.success() {
+            trace!("Child failed, returning its exit code");
+            std::process::exit(exit_status.code().unwrap_or(0))
+        }
+        trace!("Command was successful");
     }
-    trace!("Command was succesful");
 
     if let (Some(inventory), Some(cur_key)) = (inventory.as_mut(), cur_key) {
         if let Some(output_size) = inventory.output_size(&opt.output_path) {
-            if inventory.limit_cache(output_size, opt.cache_size).is_ok() {
+            if !opt.dry_run && inventory.limit_cache(output_size, opt.cache_size).is_ok() {
                 inventory.insert(&opt.output_path, cur_key);
                 inventory.persist();
             }
@@ -105,17 +108,10 @@ struct Opt {
 
     #[structopt(required = true)]
     command: Vec<String>,
-}
 
-impl Opt {
-    fn non_zero_bytes(input: &str) -> Result<u64, &'static str> {
-        let parsed = bytefmt::parse(input)?;
-        if parsed == 0 {
-            Err("Cache size cannot be zero")
-        } else {
-            Ok(parsed)
-        }
-    }
+    /// Do not run command or modify cache + log intermediate hashes (has a performance hit)
+    #[structopt(long)]
+    dry_run: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -128,7 +124,7 @@ impl Inventory {
     fn load(path: PathBuf) -> Option<Self> {
         let inventory_path = path.join(".inventory.ron");
         if inventory_path.is_file() {
-            debug!("Medatadata file found");
+            debug!("Inventory file found");
             File::open(&inventory_path)
                 .map_err(Report::msg)
                 .and_then(|file| {
@@ -172,20 +168,21 @@ impl Inventory {
         result
     }
 
-    fn restore(&mut self, key: &CacheKey, output_path: &PathBuf) -> bool {
+    fn restore(&mut self, key: &CacheKey, output_path: &PathBuf, dry_run: bool) -> bool {
         let cached_path = self.to_path(&key);
         if let Some(val) = self.inv.get_mut(&key) {
             info!(
                 "Found cached entry, copying {}",
                 cached_path.to_string_lossy()
             );
-            if File::open(&cached_path)
-                .map(|file| GzDecoder::new(file))
-                .map(|tar| tar::Archive::new(tar))
-                .and_then(|mut archive| archive.unpack(output_path))
-                .wrap_err("Folca: Cannot extract cached tar")
-                .map_err(|e| warn!("{}", e))
-                .is_ok()
+            if !dry_run
+                && File::open(&cached_path)
+                    .map(|file| GzDecoder::new(file))
+                    .map(|tar| tar::Archive::new(tar))
+                    .and_then(|mut archive| archive.unpack(output_path))
+                    .wrap_err("Folca: Cannot extract cached tar")
+                    .map_err(|e| warn!("{}", e))
+                    .is_ok()
             {
                 val.last_used = std::time::SystemTime::now();
                 return true;
@@ -306,6 +303,15 @@ struct CacheKey {
 }
 
 impl Opt {
+    fn non_zero_bytes(input: &str) -> Result<u64, &'static str> {
+        let parsed = bytefmt::parse(input)?;
+        if parsed == 0 {
+            Err("Cache size cannot be zero")
+        } else {
+            Ok(parsed)
+        }
+    }
+
     fn create_key(&self) -> Option<CacheKey> {
         let command_hash = {
             let mut command_hasher = DefaultHasher::new();
@@ -317,6 +323,12 @@ impl Opt {
 
         let mut hasher = blake3::Hasher::new();
         let mut buffer = Vec::new();
+        if self.dry_run {
+            trace!(
+                "initial hash state: {:x}",
+                simple_hash(hasher.finalize().as_bytes())
+            );
+        }
 
         let update_hash = |entry: Result<ignore::DirEntry, ignore::Error>| -> Result<()> {
             let dir_entry = entry.map_err(|e| {
@@ -325,6 +337,13 @@ impl Opt {
             })?;
             let path = dir_entry.path();
             hasher.update(&path.to_string_lossy().as_bytes().to_vec());
+            if self.dry_run {
+                trace!(
+                    "after hashing the path {}: {:x}",
+                    path.to_string_lossy(),
+                    simple_hash(hasher.finalize().as_bytes())
+                );
+            }
 
             if !path.is_file() {
                 return Ok(());
@@ -333,8 +352,16 @@ impl Opt {
                 .map(|file| BufReader::new(file))
                 .and_then(|mut reader| {
                     reader.read_to_end(&mut buffer).map(|_| {
+                        trace!("hashing content of {}", path.to_string_lossy());
                         hasher.update(&buffer);
                         buffer.clear();
+                        if self.dry_run {
+                            trace!(
+                                "after hashing the content of {}: {:x}",
+                                path.to_string_lossy(),
+                                simple_hash(hasher.finalize().as_bytes())
+                            );
+                        }
                     })
                 })
                 .wrap_err(format!(
@@ -348,7 +375,6 @@ impl Opt {
             .git_exclude(!self.no_ignore)
             .sort_by_file_path(|p1, p2| p1.cmp(p2))
             .skip_stdout(true)
-            .filter_entry(|dir_entry| dir_entry.file_type().map_or(false, |x| x.is_file()))
             .build()
             .try_for_each(update_hash)
             .wrap_err("Folca: cannot hash input")
