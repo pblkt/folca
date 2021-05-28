@@ -11,3 +11,9 @@ Respects `.gitignore` in the input folder by default.
 ```
 folca INPUT_PATH OUTPUT_PATH COMMAND COMMAND_ARG1 COMMAND_ARG2 ...
 ```
+
+## Installation
+### Downloading binaries
+`Folca` is downloadable from the releases [page](/../../releases).
+### Cargo 
+Run `cargo install folca`
