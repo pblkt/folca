@@ -1,8 +1,10 @@
 [package]
 name = "folca"
 version = "0.1.0"
-authors = ["pblkt <pblkt@yadayadayada.github.com>"]
+authors = ["pblkt <pblkt@users-no-reply.github.com>"]
 edition = "2018"
+description = "A commanad line FOLder CAche"
+license = "MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
