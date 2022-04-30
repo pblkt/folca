@@ -238,15 +238,14 @@ impl Inventory {
             cached_path.to_string_lossy()
         );
 
-        std::fs::create_dir_all(&cached_path.parent().unwrap()).and_then(|_| {
-            File::create(&cached_path)
-                .map(|file| GzEncoder::new(file, Compression::default()))
-                .and_then(|enc| {
-                    let mut tar = tar::Builder::new(enc);
-                    tar.append_dir_all(".", &output_path)
-                        .and_then(|_| tar.finish())
-                })
-        })?;
+        std::fs::create_dir_all(&cached_path.parent().unwrap())?;
+
+        let mut tar = tar::Builder::new(GzEncoder::new(
+            File::create(&cached_path)?,
+            Compression::default(),
+        ));
+        tar.append_dir_all(".", &output_path)?;
+        tar.finish()?;
 
         Ok(self.output_size(output_path)?)
     }
