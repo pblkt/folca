@@ -1,6 +1,6 @@
 [package]
 name = "folca"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["pblkt <pblkt@users-no-reply.github.com>"]
 edition = "2018"
 description = "A commanad line FOLder CAche"
@@ -15,11 +15,7 @@ bytefmt = "~0.1"
 color-eyre = "~0.5"
 simplelog = "~0.10"
 log = "~0.4"
-ron = "~0.6"
-serde = { version = "~1.0", features = ["derive"] }
-blake3 = "^0.3"
 walkdir = "^2.3"
-hex = "^0.4"
-dircpy-stable = "^0.3"
 flate2 = "^1.0"
 tar = "^0.4"
+regex = "^1.5.5"
