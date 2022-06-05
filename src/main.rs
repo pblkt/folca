@@ -6,16 +6,15 @@ use ignore::WalkBuilder;
 use log::{info, trace, warn};
 use regex::Regex;
 use simplelog::{ColorChoice, ConfigBuilder, TermLogger, TerminalMode};
-use std;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::Hasher;
 use std::io::{BufReader, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use structopt::StructOpt;
-use tar;
 use walkdir::WalkDir;
 
 fn main() -> Result<(), Report> {
@@ -44,7 +43,7 @@ fn main() -> Result<(), Report> {
     trace!("Computed key: {:#?}", cur_key);
 
     if let (Some(cur_key), Some(inventory)) = (&cur_key, inventory.as_mut()) {
-        if inventory.try_restore_from_cache(&cur_key, &opt.output_path, opt.dry_run) {
+        if inventory.try_restore_from_cache(cur_key, &opt.output_path, opt.dry_run) {
             return Ok(());
         }
     }
@@ -65,7 +64,7 @@ fn main() -> Result<(), Report> {
     if let (Some(inventory), Some(cur_key)) = (inventory.as_mut(), cur_key) {
         let output_size = inventory.output_size(&opt.output_path)?;
         if !opt.dry_run {
-            inventory.shrink_cache(output_size, opt.max_size)?;
+            inventory.discard_until(output_size, opt.max_cache_size)?;
             inventory.write_to_cache(&opt.output_path, &cur_key)?;
         }
     }
@@ -82,13 +81,13 @@ struct Opt {
 
     /// Hash hidden files
     #[structopt(long)]
-    hidden: bool,
+    include_hidden: bool,
 
     #[structopt(long, default_value = ".folca_cache")]
     cache_path: PathBuf,
 
     #[structopt(long, default_value = "10 GB", parse(try_from_str = Self::non_zero_bytes))]
-    max_size: u64,
+    max_cache_size: u64,
 
     /// Verbose
     #[structopt(short, long, parse(from_occurrences))]
@@ -146,7 +145,7 @@ impl Inventory {
         let mut result = Self {
             inv: HashMap::new(),
             cache_path: path,
-            regex: Regex::new(r".*/([[:xdigit:]]+)/([[:xdigit:]]{16}).tar.gz$").unwrap(),
+            regex: Regex::new(r".*/([[:a-z0-9:]]+)/([[:a-z0-9:]]{16}).tar.gz$").unwrap(),
         };
 
         if !result.cache_path.exists() {
@@ -192,24 +191,30 @@ impl Inventory {
         output_path: &PathBuf,
         dry_run: bool,
     ) -> bool {
-        let cached_path = self.to_path(&key);
+        let cached_path = self.to_path(key);
+        let output_dir = {
+            if output_path.is_file() {
+                output_path.parent().unwrap().to_path_buf()
+            } else {
+                output_path.clone()
+            }
+        };
 
-        if let Some(val) = self.inv.get_mut(&key) {
+        if let Some(val) = self.inv.get_mut(key) {
             info!(
                 "Found cached entry, copying {}",
                 cached_path.to_string_lossy()
             );
-            if !dry_run
-                && File::open(&cached_path)
-                    .map(|file| GzDecoder::new(file))
-                    .map(|tar| tar::Archive::new(tar))
-                    .and_then(|mut archive| archive.unpack(output_path))
-                    .wrap_err("Folca: Cannot extract cached tar")
-                    .map_err(|e| warn!("{}", e))
-                    .is_ok()
-            {
-                val.last_used = std::time::SystemTime::now();
-                return true;
+            if !dry_run {
+                let result = File::open(&cached_path)
+                    .map(GzDecoder::new)
+                    .map(tar::Archive::new)
+                    .and_then(|mut archive| archive.unpack(output_dir))
+                    .map_err(|e| warn!("{}", e));
+                if result.is_ok() {
+                    val.last_used = std::time::SystemTime::now();
+                }
+                return result.is_ok();
             }
         }
         info!("No such cached entry: {}", cached_path.to_string_lossy());
@@ -231,7 +236,7 @@ impl Inventory {
         if !output_path.exists() {
             std::fs::create_dir(&output_path)?
         }
-        let cached_path = self.to_path(&key);
+        let cached_path = self.to_path(key);
         trace!(
             "Copying result {} to cache {}",
             output_path.to_string_lossy(),
@@ -244,13 +249,17 @@ impl Inventory {
             File::create(&cached_path)?,
             Compression::default(),
         ));
-        tar.append_dir_all(".", &output_path)?;
+        if output_path.is_dir() {
+            tar.append_dir_all(".", output_path)?;
+        } else {
+            tar.append_path_with_name(output_path, output_path.file_name().unwrap())?;
+        }
         tar.finish()?;
 
-        Ok(self.output_size(output_path)?)
+        self.output_size(output_path)
     }
 
-    fn shrink_cache(&mut self, output_size: u64, limit: u64) -> Result<()> {
+    fn discard_until(&mut self, output_size: u64, limit: u64) -> Result<()> {
         if output_size >= limit {
             warn!("Output is larger than cache size, will not cache");
             return Ok(());
@@ -292,7 +301,7 @@ impl Inventory {
                     warn!("{}", e);
                     e
                 })?;
-            let parent = path.parent().ok_or(eyre!("Can't list empty dir"))?;
+            let parent = path.parent().ok_or_else(|| eyre!("Can't list empty dir"))?;
             if std::fs::read_dir(parent)?.next().is_none() {
                 // empty directory?
                 trace!("Directory is empty after cache limiting, cleaning up...");
@@ -330,13 +339,13 @@ impl Opt {
         };
 
         let mut hasher = DefaultHasher::new();
-        let mut buffer = Vec::new();
+        let mut buffer = vec![0u8; 125_000];
         if self.dry_run {
             trace!("initial hash state: {:x}", hasher.finish());
         }
 
         for entry in WalkBuilder::new(&self.input_path)
-            .hidden(self.hidden)
+            .hidden(self.include_hidden)
             .git_exclude(self.respect_ignore)
             .sort_by_file_path(|p1, p2| p1.cmp(p2))
             .skip_stdout(true)
@@ -347,7 +356,7 @@ impl Opt {
                 e
             })?;
             let path = dir_entry.path();
-            hasher.write(&path.to_string_lossy().as_bytes());
+            hasher.write(path.as_os_str().as_bytes());
             if self.dry_run {
                 trace!(
                     "after hashing the path {}: {:x}",
@@ -356,11 +365,19 @@ impl Opt {
                 );
             }
 
+            if path.is_dir() {
+                continue;
+            }
             if !path.is_file() {
+                warn!(
+                    "{} is not a file or a directory, skipping.",
+                    path.to_string_lossy()
+                );
                 continue;
             }
 
-            if let Err(e) = Opt::update_hasher_with_file(&mut buffer, &path, &mut hasher) {
+            trace!("Hashing content of {}", path.to_string_lossy());
+            if let Err(e) = Opt::update_hasher_with_file(&mut buffer, path, &mut hasher) {
                 warn!("{}", e);
             }
         }
@@ -372,14 +389,20 @@ impl Opt {
     }
 
     fn update_hasher_with_file(
-        buffer: &mut Vec<u8>,
+        buffer: &mut [u8],
         path: &Path,
         hasher: &mut DefaultHasher,
     ) -> Result<()> {
-        BufReader::new(File::open(path)?).read_to_end(buffer)?;
-        trace!("hashing content of {}", path.to_string_lossy());
-        hasher.write(&buffer);
-        buffer.clear();
+        let mut file_handler = BufReader::new(File::open(path)?);
+        loop {
+            let bytes_read = file_handler.read(buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.write(&buffer[0..bytes_read]);
+        }
+
+        trace!("Hashed content of {}", path.to_string_lossy());
         Ok(())
     }
 }
