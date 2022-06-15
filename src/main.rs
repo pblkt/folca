@@ -1,21 +1,20 @@
-use blake3;
-use color_eyre::eyre::{Report, Result, WrapErr};
+use color_eyre::eyre::{eyre, Report, Result, WrapErr};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use ignore::WalkBuilder;
-use log::{debug, info, trace, warn};
-use serde::{Deserialize, Serialize};
+use log::{info, trace, warn};
+use regex::Regex;
 use simplelog::{ColorChoice, ConfigBuilder, TermLogger, TerminalMode};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs::File;
 use std::hash::Hasher;
 use std::io::{BufReader, Read};
-use std::path::PathBuf;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use structopt::StructOpt;
-use tar;
 use walkdir::WalkDir;
 
 fn main() -> Result<(), Report> {
@@ -37,20 +36,14 @@ fn main() -> Result<(), Report> {
     )?;
 
     trace!("{:#?}", opt);
-    if !opt.cache_path.is_dir() {
-        debug!("Creating cache directory");
-        std::fs::create_dir(&opt.cache_path)
-            .wrap_err("Folca: cannot create cache directory:")
-            .unwrap_or_else(|e| warn!("{}", e));
-    }
 
     let mut inventory = Inventory::load(opt.cache_path.clone());
 
-    let cur_key = opt.create_key();
+    let cur_key = opt.command_input_key().map_err(|e| warn!("{}", e)).ok();
     trace!("Computed key: {:#?}", cur_key);
 
     if let (Some(cur_key), Some(inventory)) = (&cur_key, inventory.as_mut()) {
-        if inventory.restore(&cur_key, &opt.output_path, opt.dry_run) {
+        if inventory.try_restore_from_cache(cur_key, &opt.output_path, opt.dry_run) {
             return Ok(());
         }
     }
@@ -69,32 +62,32 @@ fn main() -> Result<(), Report> {
     }
 
     if let (Some(inventory), Some(cur_key)) = (inventory.as_mut(), cur_key) {
-        if let Some(output_size) = inventory.output_size(&opt.output_path) {
-            if !opt.dry_run && inventory.limit_cache(output_size, opt.cache_size).is_ok() {
-                inventory.insert(&opt.output_path, cur_key);
-                inventory.persist();
-            }
+        let output_size = inventory.output_size(&opt.output_path)?;
+        if !opt.dry_run {
+            inventory.discard_until(output_size, opt.max_cache_size)?;
+            inventory.write_to_cache(&opt.output_path, &cur_key)?;
         }
     }
 
     Ok(())
 }
+
 #[derive(Debug, StructOpt)]
 #[structopt(name = "folca", about = "Folder-based command cache")]
 struct Opt {
-    /// Do not respect `.ignore` and `.gitignore` files
+    /// Respect `.ignore` and `.gitignore` files
     #[structopt(long)]
-    no_ignore: bool,
+    respect_ignore: bool,
 
     /// Hash hidden files
     #[structopt(long)]
-    hidden: bool,
+    include_hidden: bool,
 
     #[structopt(long, default_value = ".folca_cache")]
     cache_path: PathBuf,
 
     #[structopt(long, default_value = "10 GB", parse(try_from_str = Self::non_zero_bytes))]
-    cache_size: u64,
+    max_cache_size: u64,
 
     /// Verbose
     #[structopt(short, long, parse(from_occurrences))]
@@ -114,135 +107,159 @@ struct Opt {
     dry_run: bool,
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Debug)]
 struct Inventory {
-    inv: HashMap<CacheKey, CacheValue>,
+    inv: HashMap<CommandInputHashes, LastUsedAndSize>,
     cache_path: PathBuf,
+    regex: Regex,
 }
 
 impl Inventory {
+    fn load_entry(&mut self, path: PathBuf) -> Result<()> {
+        let string_path = path.to_string_lossy().to_string();
+        let caps = self
+            .regex
+            .captures(&string_path)
+            .ok_or(eyre!(string_path.clone()))?;
+
+        let command_hash = u64::from_str_radix(&caps[1], 16)?;
+        let input_hash = u64::from_str_radix(&caps[2], 16)?;
+
+        let metadata = path.metadata()?;
+
+        self.inv.insert(
+            CommandInputHashes {
+                command_hash,
+                input_hash,
+            },
+            LastUsedAndSize {
+                last_used: metadata.accessed()?,
+                size: metadata.len(),
+            },
+        );
+
+        Ok(())
+    }
+
     fn load(path: PathBuf) -> Option<Self> {
-        let inventory_path = path.join(".inventory.ron");
-        if inventory_path.is_file() {
-            debug!("Inventory file found");
-            File::open(&inventory_path)
-                .map_err(Report::msg)
-                .and_then(|file| {
-                    let reader = BufReader::new(file);
-                    ron::de::from_reader(reader).map_err(Report::msg)
-                })
-                .wrap_err(format!(
-                    "Folca: Cannot parse {}",
-                    &inventory_path.to_string_lossy()
-                ))
-                .map_err(|e| warn!("{}", e))
-                .ok()
-        } else {
-            debug!("Medatadata file not found");
-            Some(Self {
-                inv: HashMap::new(),
-                cache_path: path,
-            })
+        let mut result = Self {
+            inv: HashMap::new(),
+            cache_path: path,
+            regex: Regex::new(r".*/([[:a-z0-9:]]+)/([[:a-z0-9:]]{16}).tar.gz$").unwrap(),
+        };
+
+        if !result.cache_path.exists() {
+            info!("Cache path does not exist");
+            return Some(result);
         }
-    }
 
-    fn persist(&self) {
-        trace!("Serializing inventory");
-        //let x: i32 =
-        let inventory_path = self.cache_path.join(".inventory.ron");
-        std::fs::File::create(inventory_path)
-            .map_err(Report::msg)
-            .and_then(|file| {
-                ron::ser::to_writer_pretty(file, &self, Default::default()).map_err(Report::msg)
+        for entry in WalkDir::new(&result.cache_path)
+            .min_depth(2)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(|e| match e {
+                Err(err) => {
+                    warn!("{}", err);
+                    None
+                }
+                Ok(walkdir_entry) => Some(walkdir_entry.path().to_owned()),
             })
-            .wrap_err("Folca: cannot serialize inventory")
-            .unwrap_or_else(|e| warn!("{}", e));
+        {
+            result
+                .load_entry(entry.to_path_buf())
+                .wrap_err(format!(
+                    "Error while loading cache entry from {}",
+                    &entry.to_string_lossy()
+                ))
+                .unwrap_or_else(|e| warn!("{}", e));
+        }
+        Some(result)
     }
 
-    fn to_path(&self, key: &CacheKey) -> PathBuf {
+    fn to_path(&self, key: &CommandInputHashes) -> PathBuf {
         let mut result = self
             .cache_path
             .join(format!("{:x}", &key.command_hash))
-            .join(format!("{:x}", simple_hash(&key.input_hash)));
+            .join(format!("{:x}", &key.input_hash));
         result.set_extension("tar.gz");
         result
     }
 
-    fn restore(&mut self, key: &CacheKey, output_path: &PathBuf, dry_run: bool) -> bool {
-        let cached_path = self.to_path(&key);
-        if let Some(val) = self.inv.get_mut(&key) {
+    fn try_restore_from_cache(
+        &mut self,
+        key: &CommandInputHashes,
+        output_path: &PathBuf,
+        dry_run: bool,
+    ) -> bool {
+        let cached_path = self.to_path(key);
+        let output_dir = {
+            if output_path.is_file() {
+                output_path.parent().unwrap().to_path_buf()
+            } else {
+                output_path.clone()
+            }
+        };
+
+        if let Some(val) = self.inv.get_mut(key) {
             info!(
                 "Found cached entry, copying {}",
                 cached_path.to_string_lossy()
             );
-            if !dry_run
-                && File::open(&cached_path)
-                    .map(|file| GzDecoder::new(file))
-                    .map(|tar| tar::Archive::new(tar))
-                    .and_then(|mut archive| archive.unpack(output_path))
-                    .wrap_err("Folca: Cannot extract cached tar")
-                    .map_err(|e| warn!("{}", e))
-                    .is_ok()
-            {
-                val.last_used = std::time::SystemTime::now();
-                return true;
+            if !dry_run {
+                let result = File::open(&cached_path)
+                    .map(GzDecoder::new)
+                    .map(tar::Archive::new)
+                    .and_then(|mut archive| archive.unpack(output_dir))
+                    .map_err(|e| warn!("{}", e));
+                if result.is_ok() {
+                    val.last_used = std::time::SystemTime::now();
+                }
+                return result.is_ok();
             }
         }
         info!("No such cached entry: {}", cached_path.to_string_lossy());
         false
     }
 
-    fn output_size(&self, output_path: &PathBuf) -> Option<u64> {
-        WalkDir::new(&output_path)
-            .into_iter()
-            .try_fold(0u64, |sum, entry| {
-                entry.and_then(|entry| entry.metadata()).map(|metadata| {
-                    if metadata.is_file() {
-                        sum + metadata.len()
-                    } else {
-                        sum
-                    }
-                })
-            })
-            .wrap_err("Folca: cannot calculate output size")
-            .ok()
+    fn output_size(&self, output_path: &PathBuf) -> Result<u64> {
+        let mut sum = 0u64;
+        for entry in WalkDir::new(&output_path) {
+            let metadata = entry?.metadata()?;
+            if metadata.is_file() {
+                sum += metadata.len();
+            }
+        }
+        Ok(sum)
     }
 
-    fn insert(&mut self, output_path: &PathBuf, key: CacheKey) -> () {
-        let cached_path = self.to_path(&key);
+    fn write_to_cache(&mut self, output_path: &PathBuf, key: &CommandInputHashes) -> Result<u64> {
+        if !output_path.exists() {
+            std::fs::create_dir(&output_path)?
+        }
+        let cached_path = self.to_path(key);
         trace!(
             "Copying result {} to cache {}",
             output_path.to_string_lossy(),
             cached_path.to_string_lossy()
         );
 
-        std::fs::create_dir_all(&cached_path.parent().unwrap())
-            .and_then(|_| {
-                File::create(&cached_path)
-                    .map(|file| GzEncoder::new(file, Compression::default()))
-                    .and_then(|enc| {
-                        let mut tar = tar::Builder::new(enc);
-                        tar.append_dir_all(".", &output_path)
-                            .and_then(|_| tar.finish())
-                    })
-            })
-            .wrap_err(format!(
-                "Folca: Cannot write to cache {}",
-                &cached_path.to_string_lossy()
-            ))
-            .unwrap_or_else(|e| warn!("{}", e));
+        std::fs::create_dir_all(&cached_path.parent().unwrap())?;
 
-        let output_size = self.output_size(output_path).unwrap();
-        self.inv.insert(
-            key,
-            CacheValue {
-                size: output_size,
-                last_used: std::time::SystemTime::now(),
-            },
-        );
+        let mut tar = tar::Builder::new(GzEncoder::new(
+            File::create(&cached_path)?,
+            Compression::default(),
+        ));
+        if output_path.is_dir() {
+            tar.append_dir_all(".", output_path)?;
+        } else {
+            tar.append_path_with_name(output_path, output_path.file_name().unwrap())?;
+        }
+        tar.finish()?;
+
+        self.output_size(output_path)
     }
 
-    fn limit_cache(&mut self, output_size: u64, limit: u64) -> Result<()> {
+    fn discard_until(&mut self, output_size: u64, limit: u64) -> Result<()> {
         if output_size >= limit {
             warn!("Output is larger than cache size, will not cache");
             return Ok(());
@@ -250,7 +267,7 @@ impl Inventory {
 
         trace!("Assuring cache is within limits");
         let mut cache_size = 0u64;
-        let mut cache_entries: Vec<(CacheKey, CacheValue)> = self
+        let mut cache_entries: Vec<(CommandInputHashes, LastUsedAndSize)> = self
             .inv
             .iter()
             .map(|(key, value)| {
@@ -284,22 +301,22 @@ impl Inventory {
                     warn!("{}", e);
                     e
                 })?;
+            let parent = path.parent().ok_or_else(|| eyre!("Can't list empty dir"))?;
+            if std::fs::read_dir(parent)?.next().is_none() {
+                // empty directory?
+                trace!("Directory is empty after cache limiting, cleaning up...");
+                std::fs::remove_dir(parent)?;
+            }
             cache_size -= value.size;
         }
         Ok(())
     }
 }
 
-fn simple_hash(x: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    hasher.write(x);
-    hasher.finish()
-}
-
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hash)]
-struct CacheKey {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct CommandInputHashes {
     command_hash: u64,
-    input_hash: Vec<u8>,
+    input_hash: u64,
 }
 
 impl Opt {
@@ -312,7 +329,7 @@ impl Opt {
         }
     }
 
-    fn create_key(&self) -> Option<CacheKey> {
+    fn command_input_key(&self) -> Result<CommandInputHashes> {
         let command_hash = {
             let mut command_hasher = DefaultHasher::new();
             for command_part in &self.command {
@@ -321,74 +338,77 @@ impl Opt {
             command_hasher.finish()
         };
 
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = Vec::new();
+        let mut hasher = DefaultHasher::new();
+        let mut buffer = vec![0u8; 125_000];
         if self.dry_run {
-            trace!(
-                "initial hash state: {:x}",
-                simple_hash(hasher.finalize().as_bytes())
-            );
+            trace!("initial hash state: {:x}", hasher.finish());
         }
 
-        let update_hash = |entry: Result<ignore::DirEntry, ignore::Error>| -> Result<()> {
+        for entry in WalkBuilder::new(&self.input_path)
+            .hidden(self.include_hidden)
+            .git_exclude(self.respect_ignore)
+            .sort_by_file_path(|p1, p2| p1.cmp(p2))
+            .skip_stdout(true)
+            .build()
+        {
             let dir_entry = entry.map_err(|e| {
                 warn!("{}", e);
                 e
             })?;
             let path = dir_entry.path();
-            hasher.update(&path.to_string_lossy().as_bytes().to_vec());
+            hasher.write(path.as_os_str().as_bytes());
             if self.dry_run {
                 trace!(
                     "after hashing the path {}: {:x}",
                     path.to_string_lossy(),
-                    simple_hash(hasher.finalize().as_bytes())
+                    hasher.finish()
                 );
             }
 
-            if !path.is_file() {
-                return Ok(());
+            if path.is_dir() {
+                continue;
             }
-            File::open(path)
-                .map(|file| BufReader::new(file))
-                .and_then(|mut reader| {
-                    reader.read_to_end(&mut buffer).map(|_| {
-                        trace!("hashing content of {}", path.to_string_lossy());
-                        hasher.update(&buffer);
-                        buffer.clear();
-                        if self.dry_run {
-                            trace!(
-                                "after hashing the content of {}: {:x}",
-                                path.to_string_lossy(),
-                                simple_hash(hasher.finalize().as_bytes())
-                            );
-                        }
-                    })
-                })
-                .wrap_err(format!(
-                    "Folca: cannot hash file: {:?}",
-                    &path.to_string_lossy()
-                ))
-        };
+            if !path.is_file() {
+                warn!(
+                    "{} is not a file or a directory, skipping.",
+                    path.to_string_lossy()
+                );
+                continue;
+            }
 
-        WalkBuilder::new(&self.input_path)
-            .hidden(self.hidden)
-            .git_exclude(!self.no_ignore)
-            .sort_by_file_path(|p1, p2| p1.cmp(p2))
-            .skip_stdout(true)
-            .build()
-            .try_for_each(update_hash)
-            .wrap_err("Folca: cannot hash input")
-            .map_err(|e| warn!("{}", e))
-            .map(|_| CacheKey {
-                input_hash: hasher.finalize().as_bytes().to_vec(),
-                command_hash,
-            })
-            .ok()
+            trace!("Hashing content of {}", path.to_string_lossy());
+            if let Err(e) = Opt::update_hasher_with_file(&mut buffer, path, &mut hasher) {
+                warn!("{}", e);
+            }
+        }
+
+        Ok(CommandInputHashes {
+            input_hash: hasher.finish(),
+            command_hash,
+        })
+    }
+
+    fn update_hasher_with_file(
+        buffer: &mut [u8],
+        path: &Path,
+        hasher: &mut DefaultHasher,
+    ) -> Result<()> {
+        let mut file_handler = BufReader::new(File::open(path)?);
+        loop {
+            let bytes_read = file_handler.read(buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            hasher.write(&buffer[0..bytes_read]);
+        }
+
+        trace!("Hashed content of {}", path.to_string_lossy());
+        Ok(())
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize, Debug)]
-struct CacheValue {
+#[derive(Clone, Copy, Debug)]
+struct LastUsedAndSize {
     last_used: std::time::SystemTime,
     size: u64,
 }
